@@ -1,0 +1,628 @@
+rules_version = '2';
+
+/**
+ * SECURITY RULES — Phase 1 (users, restaurants, restaurantUsers) + Phase 2
+ * (member role/status/permission management) + Phase 3 (menu categories
+ * and menu items) + Phase 4 (ingredients and the stock ledger — purchases,
+ * waste, and manual adjustments all write through it; no supplier module)
+ * + Phase 5 (recipes for food-cost/margin calculation, and a manually
+ * entered daily sales tally used for the Sales Report — no automatic
+ * ingredient-stock deduction; see PHASE_5_REPORT.md) + Phase 6 (expense
+ * categories and expenses — editable, void-instead-of-delete; see
+ * PHASE_6_REPORT.md) + Phase 7 (Profit & Loss report — read-only over the
+ * existing dailySales/expenses collections, no new rules; see
+ * PHASE_7_REPORT.md) + Phase 8 (Restaurant Profile/Settings — editing the
+ * tenant root document now requires the 'restaurant.settings' permission
+ * instead of a hard-coded owner-only check; see PHASE_8_REPORT.md) + Phase 9
+ * (Menu Costing — read-only over existing menuItems/ingredients/recipes
+ * collections, no new rules; see PHASE_9_REPORT.md) + Phase 10 (personal
+ * account Settings — profile name/phone/photo and password (an email-change
+ * card shipped then was removed same day at user request); all through the
+ * existing users/{userId} self-update rule and Firebase Auth's own
+ * reauthentication requirement, no new match blocks; see PHASE_10_REPORT.md)
+ * + Phase 11 (P&L CSV/PDF export — pure client-side export of data already
+ * read via Phase 7's queries, no new reads, no rule changes at all; see
+ * PHASE_11_REPORT.md) + Phase 12 (expense receipt photos — one new field,
+ * receiptUrl, on the existing expenses match block, no new rules; see
+ * PHASE_12_REPORT.md) + Phase 13 (recurring expense templates — a new
+ * recurringExpenseTemplates collection, expense.edit to manage, plus a
+ * narrow expense.create update branch for logging a due one; see
+ * PHASE_13_REPORT.md) + Phase 14 (Menu Profitability report — read-only,
+ * sales-weighted aggregation over the existing dailySales collection via
+ * Phase 7's range query, no new rules; see PHASE_14_REPORT.md) + Phase 15
+ * (team member invites, REINTRODUCED after Phase 2's removal — a new
+ * top-level `invites` collection, deliberately NOT a
+ * restaurants/{restaurantId}/invites subcollection, plus a second create
+ * branch on restaurantUsers for accepting one; see PHASE_15_REPORT.md for
+ * the full design and its relationship to the Phase 2 incident below) +
+ * Phase 16 (manual billing/invoicing — a new
+ * restaurants/{restaurantId}/invoices subcollection, immutable once issued
+ * except for a void transition, gated on the previously-unused
+ * orders.view/orders.create/orders.edit permissions; plus a narrow second
+ * branch on the restaurants/{restaurantId} update rule so issuing an
+ * invoice can atomically bump settings.nextInvoiceNumber without needing
+ * full 'restaurant.settings' access; see PHASE_16_REPORT.md for why this
+ * is NOT the excluded Orders/POS module). No supplier module — permanently
+ * out of scope. No live order-taking/kitchen-ticket/table-management
+ * Orders/POS module — permanently out of scope (user request, 2026-08-23).
+ * Subcollections under restaurants/{restaurantId}/... for anything else
+ * get their own match blocks as each is introduced in later phases. Until
+ * then they are implicitly denied.
+ *
+ * Tenant isolation model:
+ *  - restaurants/{restaurantId} is the tenant root.
+ *  - restaurantUsers/{restaurantId}_{userId} is the membership record. Its
+ *    composite doc ID lets every rule below do a cheap exists()/get() instead
+ *    of running a query inside a security rule.
+ *  - A user can read a restaurant (and its subcollections) only if an ACTIVE
+ *    restaurantUsers doc exists for that restaurant + their uid.
+ *
+ * Team invites were first attempted in Phase 2 (a restaurants/{id}/invites
+ * SUBCOLLECTION discovered via a collectionGroup('invites') query) and then
+ * removed: the authorizing rule for that query hit a Firestore rules
+ * query-provability limitation that could not be resolved without live
+ * access to test against (see PHASE_2_REPORT.md and the project doc for the
+ * full incident writeup). Phase 15 reintroduced the feature with a
+ * DIFFERENT shape specifically chosen to avoid that failure mode — a
+ * top-level `invites` collection, never queried via collectionGroup() —
+ * see the invites match block below and PHASE_15_REPORT.md. This still
+ * carries real, explicitly-acknowledged risk: this sandbox has no live
+ * Firestore access to test against, same limitation that caused the
+ * original incident, so if invites still don't work once the user tests
+ * live, don't repeat the same blind-iteration mistake — see
+ * PHASE_15_REPORT.md's rollback note.
+ *
+ * Today only the restaurant OWNER can manage users — that matches the fixed
+ * role table in src/types/permissions.ts, where 'users.manage' is granted
+ * only to the 'owner' role. If a future phase ever grants users.manage to a
+ * non-owner role via permissionOverrides, the canManageUsers() helper below
+ * needs to check that override too — it intentionally does NOT today, to
+ * keep this rule set simple and auditable.
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function membershipId(restaurantId) {
+      return restaurantId + '_' + request.auth.uid;
+    }
+
+    function membershipDoc(restaurantId) {
+      return get(/databases/$(database)/documents/restaurantUsers/$(membershipId(restaurantId)));
+    }
+
+    function isMember(restaurantId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/restaurantUsers/$(membershipId(restaurantId)))
+        && membershipDoc(restaurantId).data.status == 'active';
+    }
+
+    function isOwner(restaurantId) {
+      return isMember(restaurantId) && membershipDoc(restaurantId).data.role == 'owner';
+    }
+
+    // See the file-level comment above: owner-only today, by design.
+    function canManageUsers(restaurantId) {
+      return isOwner(restaurantId);
+    }
+
+    // Manual mirror of ROLE_PERMISSIONS in src/types/permissions.ts — rules
+    // can't import TS, so this list must be kept in sync by hand whenever
+    // that file changes. Used by hasPermission() below.
+    function rolePermissions(role) {
+      return role == 'owner' ? [
+          'menu.view', 'menu.create', 'menu.edit', 'menu.delete',
+          'recipes.view', 'recipes.edit',
+          'inventory.view', 'inventory.create', 'inventory.edit', 'inventory.adjust',
+          'suppliers.view', 'suppliers.edit',
+          'purchase.view', 'purchase.create', 'purchase.edit',
+          'orders.view', 'orders.create', 'orders.edit',
+          'waste.view', 'waste.create',
+          'expense.view', 'expense.create', 'expense.edit',
+          'reports.view', 'reports.financial',
+          'users.manage', 'restaurant.settings'
+        ] :
+        role == 'manager' ? [
+          'menu.view', 'recipes.view', 'inventory.view', 'inventory.create', 'inventory.edit',
+          'suppliers.view', 'purchase.view', 'purchase.create', 'orders.view', 'orders.create', 'orders.edit',
+          'waste.view', 'waste.create', 'expense.view', 'expense.create', 'reports.view'
+        ] :
+        role == 'kitchen_manager' ? [
+          'menu.view', 'recipes.view', 'recipes.edit', 'inventory.view', 'inventory.adjust', 'waste.view', 'waste.create'
+        ] :
+        role == 'cashier' ? ['orders.view', 'orders.create', 'menu.view'] :
+        role == 'inventory_manager' ? [
+          'inventory.view', 'inventory.create', 'inventory.edit', 'inventory.adjust',
+          'suppliers.view', 'suppliers.edit', 'purchase.view', 'purchase.create', 'purchase.edit',
+          'waste.view', 'waste.create'
+        ] :
+        role == 'accountant' ? [
+          'expense.view', 'expense.create', 'expense.edit', 'purchase.view', 'orders.view', 'reports.view', 'reports.financial'
+        ] :
+        [];
+    }
+
+    // Resolves the EFFECTIVE permission set the same way resolvePermissions()
+    // does in src/types/permissions.ts: role defaults, then permissionOverrides
+    // grant/revoke individual permissions on top. This is the general-purpose
+    // permission check for feature areas (menu, recipes, inventory, ...) —
+    // canManageUsers()/isOwner() above stay as they are (role-only, no
+    // override support) since users.manage is owner-only by design; this one
+    // is for permissions that ARE meant to be overridable per-member.
+    //
+    // Safe for query-provability: restaurantId here is always pinned by a
+    // literal path segment (restaurants/{knownId}/menuItems, etc.), never by
+    // a collectionGroup() wildcard — see the file-level comment above for why
+    // that distinction is the one that matters for list/query rules.
+    function hasPermission(restaurantId, permission) {
+      let member = membershipDoc(restaurantId).data;
+      let overrides = member.permissionOverrides;
+      return isMember(restaurantId) && (
+        (overrides != null && permission in overrides && overrides[permission] == true) ||
+        ((overrides == null || !(permission in overrides)) && permission in rolePermissions(member.role))
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // users/{userId} — a user's own profile. Nobody else may read or write it.
+    // (Other members see a person's name/email via the DENORMALIZED copy on
+    // their restaurantUsers doc, never by reading this collection directly —
+    // see RestaurantUser.displayName/email in src/types/restaurantUser.ts.)
+    // ---------------------------------------------------------------------
+    match /users/{userId} {
+      allow read: if isSelf(userId);
+      allow create: if isSelf(userId)
+        && request.resource.data.userId == userId;
+      allow update: if isSelf(userId)
+        && request.resource.data.userId == resource.data.userId; // userId immutable
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId} — tenant root document.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId} {
+      allow read: if isMember(restaurantId);
+
+      // Creating a restaurant: caller must be signed in and must name
+      // themselves as owner. The matching restaurantUsers owner doc is
+      // created in the same client-side batch (see restaurantService) and
+      // is independently validated by the rule below.
+      allow create: if isSignedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.restaurantId == restaurantId;
+
+      // Two ways this document can be updated (Phase 16 added the second):
+      //  (a) editing the profile/settings (Phase 8) needs 'restaurant.settings' —
+      //      owner-only by default (see rolePermissions() below), but override-
+      //      capable like every other permission, so an owner CAN grant this to
+      //      e.g. an accountant without a role change. Ownership itself can
+      //      never move through this path, regardless of who's editing.
+      //  (b) issuing an invoice (Phase 16) needs to atomically bump
+      //      `settings.nextInvoiceNumber` by exactly 1 — gated on
+      //      'orders.create' (the same permission that gates creating an
+      //      invoice document itself, see the invoices match block below),
+      //      NOT 'restaurant.settings', since a cashier issuing bills has no
+      //      business editing GST%/service charge%/business info. Every
+      //      OTHER settings subfield must stay byte-for-byte identical —
+      //      checked field-by-field because `diff().affectedKeys()` only
+      //      sees the top-level `settings` key changing, not which nested
+      //      field inside it changed.
+      allow update: if
+        (hasPermission(restaurantId, 'restaurant.settings')
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.restaurantId == resource.data.restaurantId
+          && request.resource.data.status == resource.data.status)
+        ||
+        (hasPermission(restaurantId, 'orders.create')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['settings', 'updatedAt'])
+          && request.resource.data.settings.nextInvoiceNumber == resource.data.settings.nextInvoiceNumber + 1
+          && request.resource.data.settings.invoicePrefix == resource.data.settings.invoicePrefix
+          && request.resource.data.settings.gstPercent == resource.data.settings.gstPercent
+          && request.resource.data.settings.serviceChargePercent == resource.data.settings.serviceChargePercent
+          && request.resource.data.settings.defaultWeightUnit == resource.data.settings.defaultWeightUnit
+          && request.resource.data.settings.defaultVolumeUnit == resource.data.settings.defaultVolumeUnit
+          && request.resource.data.settings.financialYearStartMonth == resource.data.settings.financialYearStartMonth
+          && request.resource.data.settings.targetFoodCostPercent == resource.data.settings.targetFoodCostPercent);
+
+      // No hard delete of a restaurant — use status: 'archived' instead.
+      allow delete: if false;
+
+      // Team invites (Phase 2, removed, then reintroduced in Phase 15) live
+      // entirely in the top-level `invites` collection below, not as a
+      // subcollection of this document — see that match block's own comment.
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurantUsers/{restaurantId}_{userId} — membership + role.
+    // ---------------------------------------------------------------------
+    match /restaurantUsers/{membershipId} {
+      // A user can always read their own membership doc; any active member
+      // of a restaurant can read the full member list for that restaurant
+      // (the Users page) — enforced via the resource's own restaurantId
+      // field once at least one active membership exists.
+      allow read: if isSignedIn()
+        && (resource.data.userId == request.auth.uid || isMember(resource.data.restaurantId));
+
+      // Two ways a membership doc can be created (Phase 15 added the second):
+      //  (a) the owner-at-restaurant-creation-time path (role 'owner', no
+      //      invite involved) — unchanged since Phase 1.
+      //  (b) accepting a pending invite (role != 'owner') — the new doc must
+      //      point at an invites/{acceptedFromInviteId} doc that is PENDING,
+      //      addressed to this exact signed-in user's email, for this exact
+      //      restaurant, granting this exact role. The get() call below reads
+      //      exactly ONE document at a path taken directly from this write's
+      //      own data — a single-document read inside a create rule, not a
+      //      list/query rule, so the get()/collectionGroup query-provability
+      //      limitation that killed Phase 2's invite feature (see the
+      //      file-level comment above and PHASE_15_REPORT.md) does not apply
+      //      here at all; that limitation is specific to authorizing a `list`
+      //      request over an unbounded result set, which this isn't.
+      allow create: if isSignedIn()
+        && request.resource.data.userId == request.auth.uid
+        && membershipId == request.resource.data.restaurantId + '_' + request.auth.uid
+        && request.resource.data.permissionOverrides == null
+        && request.resource.data.status == 'active'
+        && (
+          (request.resource.data.role == 'owner'
+            && request.resource.data.acceptedFromInviteId == null)
+          ||
+          (request.resource.data.role != 'owner'
+            && request.resource.data.acceptedFromInviteId != null
+            && get(/databases/$(database)/documents/invites/$(request.resource.data.acceptedFromInviteId)).data.status == 'pending'
+            && get(/databases/$(database)/documents/invites/$(request.resource.data.acceptedFromInviteId)).data.email == request.auth.token.email.lower()
+            && get(/databases/$(database)/documents/invites/$(request.resource.data.acceptedFromInviteId)).data.restaurantId == request.resource.data.restaurantId
+            && get(/databases/$(database)/documents/invites/$(request.resource.data.acceptedFromInviteId)).data.role == request.resource.data.role)
+        );
+
+      // The owner can change a non-owner member's role, status, or
+      // permission overrides — never touching their own membership (there is
+      // always exactly one owner; transferring ownership is a separate,
+      // not-yet-built feature) and never granting 'owner' through this path.
+      allow update: if canManageUsers(resource.data.restaurantId)
+        && resource.data.role != 'owner'
+        && request.resource.data.role != 'owner'
+        && request.resource.data.restaurantId == resource.data.restaurantId
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.acceptedFromInviteId == resource.data.acceptedFromInviteId;
+
+      allow delete: if false; // suspend via status, never hard-delete a membership.
+    }
+
+    // ---------------------------------------------------------------------
+    // invites/{inviteId} — Phase 15. TOP-LEVEL collection, deliberately NOT
+    // a restaurants/{restaurantId}/invites subcollection — see the type-level
+    // doc comment on RestaurantInvite (src/types/invite.ts) and
+    // PHASE_15_REPORT.md for why the Phase 2 design (a collectionGroup query
+    // over that subcollection shape) was permanently removed and why this
+    // shape avoids the same failure mode.
+    //
+    // The read rule below is a single `||` of two branches — deliberately
+    // the SAME shape as restaurantUsers' own read rule above (which already
+    // works): one pure field-comparison branch with NO get() at all (the
+    // invitee finding their own invites), and one get()-based branch pinned
+    // by the query's own where('restaurantId','==', X) filter (the
+    // restaurant admin listing invites they sent). Every query this app
+    // actually runs against this collection filters on exactly one of
+    // `email` or `restaurantId` (see listPendingInvitesForEmail /
+    // listInvitesForRestaurant in src/services/inviteService.ts) — never
+    // BOTH unpinned dimensions at once, and never via collectionGroup().
+    // ---------------------------------------------------------------------
+    match /invites/{inviteId} {
+      allow read: if isSignedIn()
+        && (resource.data.email == request.auth.token.email.lower()
+            || canManageUsers(resource.data.restaurantId));
+
+      // Only an owner/admin of the target restaurant can send an invite.
+      // Ownership itself is never granted this way.
+      allow create: if canManageUsers(request.resource.data.restaurantId)
+        && request.resource.data.invitedBy == request.auth.uid
+        && request.resource.data.email == request.resource.data.email.lower()
+        && request.resource.data.role != 'owner'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.acceptedAt == null
+        && request.resource.data.acceptedByUserId == null;
+
+      // Three narrow, independent ways an invite can move off 'pending' —
+      // each scoped via diff().affectedKeys().hasOnly([...]) to touch only
+      // the fields that specific action needs, same narrow-permission-slice
+      // pattern as Phase 13's recurringExpenseTemplates update rule:
+      //  - the restaurant admin revokes it
+      //  - the invitee declines it
+      //  - the invitee accepts it (stamping who/when) — paired, in the same
+      //    client-side batch, with a new restaurantUsers doc; see the
+      //    create rule above and acceptInvite() in inviteService.ts.
+      allow update: if
+        (canManageUsers(resource.data.restaurantId)
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'revoked'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+        ||
+        (isSignedIn()
+          && resource.data.email == request.auth.token.email.lower()
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'declined'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']))
+        ||
+        (isSignedIn()
+          && resource.data.email == request.auth.token.email.lower()
+          && resource.data.status == 'pending'
+          && request.resource.data.status == 'accepted'
+          && request.resource.data.acceptedByUserId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedAt', 'acceptedByUserId']));
+
+      // No hard delete — a revoked/declined/accepted invite stays as a
+      // record, same "never erase history" spirit as restaurantUsers above.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/menuCategories/{categoryId} — Phase 3.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/menuCategories/{categoryId} {
+      allow read: if hasPermission(restaurantId, 'menu.view');
+      allow create: if hasPermission(restaurantId, 'menu.create')
+        && request.resource.data.restaurantId == restaurantId;
+      allow update: if hasPermission(restaurantId, 'menu.edit')
+        && request.resource.data.restaurantId == resource.data.restaurantId;
+      // Deleting a category with menu items still in it is blocked
+      // client-side (see menuService.deleteCategory) — Firestore rules can't
+      // easily express that cross-document check, so this only enforces the
+      // permission, not the referential-integrity guard.
+      allow delete: if hasPermission(restaurantId, 'menu.delete');
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/menuItems/{itemId} — Phase 3.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/menuItems/{itemId} {
+      allow read: if hasPermission(restaurantId, 'menu.view');
+      allow create: if hasPermission(restaurantId, 'menu.create')
+        && request.resource.data.restaurantId == restaurantId;
+      allow update: if hasPermission(restaurantId, 'menu.edit')
+        && request.resource.data.restaurantId == resource.data.restaurantId;
+      allow delete: if hasPermission(restaurantId, 'menu.delete');
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/ingredients/{ingredientId} — Phase 4.
+    // `currentStockQty`/`costPerUnitMinor` are derived fields, only ever
+    // meant to change via the stockLedger-paired transactions in
+    // inventoryService.ts (recordPurchase/recordWaste/recordAdjustment) or,
+    // for cost, a direct correction — see the three-branch update rule below,
+    // which enforces exactly which fields each kind of caller may touch.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/ingredients/{ingredientId} {
+      allow read: if hasPermission(restaurantId, 'inventory.view');
+      allow create: if hasPermission(restaurantId, 'inventory.create')
+        && request.resource.data.restaurantId == restaurantId;
+
+      allow update: if
+        // A. Full master-data edit (name/category/unit/cost/reorder/active).
+        // Stock quantity is NEVER touched on this path — it only ever moves
+        // through a ledger-paired transaction (branches B/C below), so the
+        // ledger stays the single source of truth for how it got there.
+        (hasPermission(restaurantId, 'inventory.edit')
+          && request.resource.data.restaurantId == resource.data.restaurantId
+          && request.resource.data.currentStockQty == resource.data.currentStockQty)
+        ||
+        // B. Purchase-driven: recordPurchase() increases stock AND updates
+        // cost to the purchase's unit cost ("last cost" method). Nothing
+        // else may change.
+        (hasPermission(restaurantId, 'purchase.create')
+          && request.resource.data.restaurantId == resource.data.restaurantId
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.category == resource.data.category
+          && request.resource.data.unit == resource.data.unit
+          && request.resource.data.reorderLevel == resource.data.reorderLevel
+          && request.resource.data.isActive == resource.data.isActive)
+        ||
+        // C. Waste/adjustment-driven: recordWaste()/recordAdjustment() only
+        // ever change the quantity — cost and master data are untouched.
+        // inventory.create is included here too, for the opening-stock
+        // adjustment entry written at ingredient-creation time (see
+        // createIngredient() — someone trusted to create new ingredients is
+        // also trusted to set their starting count).
+        ((hasPermission(restaurantId, 'waste.create')
+            || hasPermission(restaurantId, 'inventory.adjust')
+            || hasPermission(restaurantId, 'inventory.create'))
+          && request.resource.data.restaurantId == resource.data.restaurantId
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.category == resource.data.category
+          && request.resource.data.unit == resource.data.unit
+          && request.resource.data.costPerUnitMinor == resource.data.costPerUnitMinor
+          && request.resource.data.reorderLevel == resource.data.reorderLevel
+          && request.resource.data.isActive == resource.data.isActive);
+
+      // Never hard-delete — the stock ledger references ingredientId/
+      // ingredientName forever as an audit trail. Archive via isActive instead.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/stockLedger/{entryId} — Phase 4.
+    // Immutable audit trail: every purchase, waste record, and manual stock
+    // adjustment. Always created in the SAME transaction as the matching
+    // ingredient update above (see inventoryService.ts) — Firestore rules
+    // validate each write independently even inside a transaction, so this
+    // rule only checks the permission for the entry's own `type`, trusting
+    // the client (this app's own code, not attacker-controlled) to pair it
+    // with the correct ingredient update.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/stockLedger/{entryId} {
+      allow read: if hasPermission(restaurantId, 'inventory.view')
+        || hasPermission(restaurantId, 'purchase.view')
+        || hasPermission(restaurantId, 'waste.view');
+
+      allow create: if request.resource.data.restaurantId == restaurantId
+        && (
+          (request.resource.data.type == 'purchase' && hasPermission(restaurantId, 'purchase.create'))
+          || (request.resource.data.type == 'waste' && hasPermission(restaurantId, 'waste.create'))
+          || (request.resource.data.type == 'adjustment' && (
+              hasPermission(restaurantId, 'inventory.adjust')
+              || hasPermission(restaurantId, 'inventory.create')
+              || hasPermission(restaurantId, 'inventory.edit')
+            ))
+        );
+
+      allow update: if false; // immutable — correct with an offsetting entry, never edit history.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/recipes/{menuItemId} — Phase 5.
+    // One recipe per menu item, doc ID == menuItemId. No new permission
+    // keys needed — recipes.view/recipes.edit already existed in
+    // src/types/permissions.ts, unused until now.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/recipes/{menuItemId} {
+      allow read: if hasPermission(restaurantId, 'recipes.view');
+      allow create, update: if hasPermission(restaurantId, 'recipes.edit')
+        && request.resource.data.restaurantId == restaurantId
+        && request.resource.data.menuItemId == menuItemId;
+      // Unlike stockLedger, a recipe isn't a financial audit trail — it's a
+      // live "current recipe" record, so removing it (going back to "no
+      // recipe defined") is allowed.
+      allow delete: if hasPermission(restaurantId, 'recipes.edit');
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/dailySales/{entryId} — Phase 5.
+    // A manually-entered daily tally of quantity sold per menu item, doc ID
+    // `{date}_{menuItemId}` (mirrors the membershipId composite-ID pattern
+    // used for restaurantUsers). Deliberately editable (unlike stockLedger)
+    // since this is a running "today's number", not an append-only event
+    // log — the client re-saves the same doc ID to correct a mistake.
+    // Read is gated by EITHER orders.view (the data-entry workflow) or a
+    // reports permission (the Sales Report reads the same collection) —
+    // note this means anyone who can read this collection at all can see
+    // the cost/profit fields in the raw document, same "the real
+    // enforcement is the permission check, the UI hiding financial columns
+    // for reports.view-only users is a convenience" pattern already
+    // documented on PermissionGuard.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/dailySales/{entryId} {
+      allow read: if hasPermission(restaurantId, 'orders.view')
+        || hasPermission(restaurantId, 'reports.view')
+        || hasPermission(restaurantId, 'reports.financial');
+
+      allow create, update: if hasPermission(restaurantId, 'orders.create')
+        && request.resource.data.restaurantId == restaurantId
+        && entryId == request.resource.data.date + '_' + request.resource.data.menuItemId
+        && request.resource.data.quantitySold is number
+        && request.resource.data.quantitySold >= 0;
+
+      // Correct a mistake by re-saving with the right quantity (even 0),
+      // not by deleting — keeps a day's record from silently disappearing.
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/expenseCategories/{categoryId} — Phase 6.
+    // Same shape/rules as menuCategories, gated on expense.edit (category
+    // management is an accountant/owner-level action, not the same
+    // permission as logging a day-to-day expense — see expense.create
+    // below).
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/expenseCategories/{categoryId} {
+      allow read: if hasPermission(restaurantId, 'expense.view');
+      allow create, update: if hasPermission(restaurantId, 'expense.edit')
+        && request.resource.data.restaurantId == restaurantId;
+      allow delete: if hasPermission(restaurantId, 'expense.edit');
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/recurringExpenseTemplates/{templateId} —
+    // Phase 13. NOT itself a financial record (no isVoided/immutability
+    // rules) — it's a saved shape ("rent, INR 25000, monthly on the 1st")
+    // that reminds the UI a real Expense is due and prefills the New
+    // Expense form. Managing the template (create/edit/pause/delete) needs
+    // expense.edit, same as expense categories. Logging the ACTUAL expense
+    // it produces goes through the expenses match block below, gated on
+    // expense.create — deliberately a separate, narrower permission than
+    // expense.edit, so a role that can log expenses day-to-day (e.g.
+    // "manager", which has expense.create but NOT expense.edit — see
+    // ROLE_PERMISSIONS) doesn't automatically get to redefine what's
+    // scheduled to recur. That same log-expense action also needs to write
+    // `lastGeneratedDate` back onto THIS document (markRecurringExpenseGenerated
+    // in expenseService.ts) — the second `allow update` branch below grants
+    // exactly that, and nothing else, to an expense.create-only caller.
+    match /restaurants/{restaurantId}/recurringExpenseTemplates/{templateId} {
+      allow read: if hasPermission(restaurantId, 'expense.view');
+      allow create: if hasPermission(restaurantId, 'expense.edit')
+        && request.resource.data.restaurantId == restaurantId;
+      allow update: if (hasPermission(restaurantId, 'expense.edit')
+          && request.resource.data.restaurantId == resource.data.restaurantId)
+        || (hasPermission(restaurantId, 'expense.create')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastGeneratedDate', 'updatedAt']));
+      allow delete: if hasPermission(restaurantId, 'expense.edit');
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/expenses/{expenseId} — Phase 6.
+    // A financial transaction record, so — like stockLedger — it is never
+    // hard-deleted. Unlike stockLedger it IS editable (expense.edit): the
+    // user asked for simple manual entry with room to fix a typo, not a
+    // strict append-only ledger. `isVoided` (also toggled via update, same
+    // permission) is the "this shouldn't count" flag — it excludes an
+    // expense from totals without erasing the record, mirroring the
+    // Archive/Restore pattern used for MenuItem/Ingredient elsewhere.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/expenses/{expenseId} {
+      allow read: if hasPermission(restaurantId, 'expense.view');
+      allow create: if hasPermission(restaurantId, 'expense.create')
+        && request.resource.data.restaurantId == restaurantId;
+      allow update: if hasPermission(restaurantId, 'expense.edit')
+        && request.resource.data.restaurantId == resource.data.restaurantId;
+      allow delete: if false; // never hard-delete a financial record — void it instead.
+    }
+
+    // ---------------------------------------------------------------------
+    // restaurants/{restaurantId}/invoices/{invoiceId} — Phase 16. A manual
+    // billing/invoicing tool, NOT the excluded Orders/POS module — see
+    // PHASE_16_REPORT.md for that distinction. Deliberately gated on the
+    // 'orders'-group permissions, reserved since Phase 1's original role
+    // table for the never-built Orders/POS (permanently excluded) and, as
+    // of Phase 5, ALSO already gating Daily Sales entry (orders.create —
+    // see DailySalesPage.tsx). orders.view/orders.edit were still fully
+    // unused before this phase. Repurposing the whole group for billing
+    // means anyone who could already log Daily Sales (manager, cashier) can
+    // now also issue invoices, and vice versa — a deliberate, considered
+    // coupling (see PHASE_16_REPORT.md), not an oversight: it's exactly
+    // what finally gives the 'cashier' role a real purpose in this app.
+    //
+    // Once issued, an invoice is IMMUTABLE except for the one issued ->
+    // voided transition — see the Invoice type's own doc comment
+    // (src/types/invoice.ts) for why. No get()/exists() calls anywhere in
+    // this block — restaurantId is pinned by the path itself (a plain
+    // subcollection, not a collectionGroup), same safe shape as every
+    // other restaurants/{restaurantId}/... collection in this file.
+    // ---------------------------------------------------------------------
+    match /restaurants/{restaurantId}/invoices/{invoiceId} {
+      allow read: if hasPermission(restaurantId, 'orders.view');
+
+      allow create: if hasPermission(restaurantId, 'orders.create')
+        && request.resource.data.restaurantId == restaurantId
+        && request.resource.data.status == 'issued'
+        && request.resource.data.voidedAt == null
+        && request.resource.data.voidedByUserId == null
+        && request.resource.data.createdByUserId == request.auth.uid;
+
+      // The ONLY update ever allowed is issued -> voided, touching only
+      // the void-related fields — every amount/line-item field is locked.
+      allow update: if hasPermission(restaurantId, 'orders.edit')
+        && resource.data.status == 'issued'
+        && request.resource.data.status == 'voided'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'voidedAt', 'voidedReason', 'voidedByUserId', 'updatedAt']);
+
+      allow delete: if false; // a numbered financial document is never hard-deleted — void it instead.
+    }
+  }
+}

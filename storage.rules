@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// PHASE 1: no file uploads are implemented yet (profile photos, restaurant
+// logos, menu item images arrive in later phases). Default-deny everything
+// until those paths are defined with proper restaurant-membership checks.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

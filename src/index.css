@@ -1,0 +1,35 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.25s ease;
+}
+
+/* Thin, theme-aware scrollbar — most of this app lives in side-scrolling
+   tables and a fixed-height sidebar, so a heavy default scrollbar stands
+   out against the rest of the redesign. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(127, 127, 127, 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(127, 127, 127, 0.35);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

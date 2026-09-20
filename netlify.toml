@@ -1,0 +1,13 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# This is a client-side-routed React app (React Router). Without this,
+# Netlify serves index.html only for "/" — refreshing or deep-linking to
+# any other route (e.g. /app/dashboard) 404s because there's no matching
+# file on disk. This rule tells Netlify to hand every path to index.html
+# and let React Router take over from there.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
